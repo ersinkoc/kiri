@@ -154,12 +154,19 @@ fn reclaim() {
     }
 }
 
+fn ensure_reclaim(reclaiming: &std::sync::atomic::AtomicBool, spawn: impl FnOnce() -> io::Result<()>) -> io::Result<()> {
+    if !reclaiming.load(std::sync::atomic::Ordering::Relaxed) {
+        spawn()?;
+        reclaiming.store(true, std::sync::atomic::Ordering::Relaxed);
+    }
+    Ok(())
+}
+
 /// Adds a router to the list, starting the take-back thread with the first.
 fn register(router: Arc<Router>) -> io::Result<()> {
+    static RECLAIMING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
     let mut routers = ROUTERS.lock().unwrap_or_else(PoisonError::into_inner);
-    if routers.is_empty() {
-        std::thread::Builder::new().name("kiri-domains-reclaim".into()).spawn(reclaim)?;
-    }
+    ensure_reclaim(&RECLAIMING, || std::thread::Builder::new().name("kiri-domains-reclaim".into()).spawn(reclaim).map(|_| ()))?;
     routers.push(router);
     Ok(())
 }
@@ -247,7 +254,7 @@ fn saved_port(kind: Kind) -> Option<u16> {
 /// Whether this engine has router ports of its own: Kiri Dev starts its
 /// routers only then, leaving 80 and 443 to the installed Kiri.
 pub fn own_ports() -> bool {
-    env_port(Kind::Http.var()).is_some() || settings_path().is_some_and(|p| p.exists())
+    env_port(Kind::Http.var()).is_some() || env_port(Kind::Https.var()).is_some() || settings_path().is_some_and(|p| p.exists())
 }
 
 /// Settings → Domains: the routers' ports, whether each runs and serves
@@ -590,11 +597,17 @@ fn respond(client: &mut impl Write, status: u16, reason: &str, body: &str) -> io
 fn local_host(host: &str) -> bool {
     let host = host.trim();
     // Without the port: `[::1]:80`, `127.0.0.1:80`, `web.kiri.localhost:8080`.
+    let valid_port = |p: &str| p.bytes().all(|b| b.is_ascii_digit()) && p.parse::<u16>().is_ok_and(|n| n != 0);
     let name = match host.strip_prefix('[') {
-        Some(v6) => v6.split(']').next().unwrap_or(""),
+        Some(v6) => match v6.split_once(']') {
+            Some((addr, "")) => addr,
+            Some((addr, rest)) if rest.strip_prefix(':').is_some_and(valid_port) => addr,
+            _ => return false,
+        },
         None => match host.rsplit_once(':') {
-            Some((name, port)) if !port.is_empty() && port.bytes().all(|b| b.is_ascii_digit()) => name,
-            _ => host,
+            Some((name, port)) if valid_port(port) => name,
+            Some(_) => return false,
+            None => host,
         },
     };
     let name = name.trim_end_matches('.').to_ascii_lowercase();
@@ -613,12 +626,50 @@ mod tests {
     /// machine's own names only: a rebinding page's Host is its own domain.
     #[test]
     fn only_this_machines_names_get_the_container_list() {
-        for local in ["localhost", "localhost:80", "nope.kiri.localhost", "NOPE.Kiri.Localhost:8080", "web.shop.kiri.local", "api.kiri.local:18780", "127.0.0.1", "127.0.0.1:80", "[::1]", "[::1]:443", "anything.localhost."] {
+        for local in ["localhost", "localhost:80", "localhost:65535", "nope.kiri.localhost", "NOPE.Kiri.Localhost:8080", "web.shop.kiri.local", "api.kiri.local:18780", "127.0.0.1", "127.0.0.1:80", "[::1]", "[::1]:1", "[::1]:443", "[::1]:65535", "anything.localhost."] {
             assert!(super::local_host(local), "{local}");
         }
-        for foreign in ["", "rebind.example.com", "rebind.example.com:80", "kiri.localhost.example.com", "localhost.example.com", "192.168.1.10", "10.0.0.1:80", "[2001:db8::1]:80", "notlocalhost", "kiri.local.evil.io"] {
+        for foreign in [
+            "",
+            "rebind.example.com",
+            "rebind.example.com:80",
+            "kiri.localhost.example.com",
+            "localhost.example.com",
+            "192.168.1.10",
+            "10.0.0.1:80",
+            "[2001:db8::1]:80",
+            "notlocalhost",
+            "kiri.local.evil.io",
+            "[::1]rebind.example.com",
+            "[::1]:notaport",
+            "[::1",
+            "[::1]:0",
+            "[::1]:65536",
+            "[::1]:+80",
+            "[::1]:",
+            "localhost:0",
+            "localhost:65536",
+            "localhost:+80",
+            "localhost:",
+            "localhost:abc",
+        ] {
             assert!(!super::local_host(foreign), "{foreign}");
         }
+    }
+
+    #[test]
+    fn reclaim_starts_once_and_https_env_port_counts_as_own_ports() {
+        let started = std::sync::atomic::AtomicBool::new(false);
+        let mut spawns = 0usize;
+        assert!(super::ensure_reclaim(&started, || Err(std::io::Error::other("transient"))).is_err());
+        for _ in 0..4 {
+            super::ensure_reclaim(&started, || {
+                spawns += 1;
+                Ok(())
+            })
+            .unwrap();
+        }
+        assert_eq!(spawns, 1, "reclaim thread starts once even across router replacements");
     }
 
     fn t(label: Option<u16>, published: &[u16], exposed: &[u16]) -> Target {
