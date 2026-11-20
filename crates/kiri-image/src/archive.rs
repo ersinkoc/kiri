@@ -15,15 +15,36 @@ use crate::store::{Image, Layer, RunConfig, Store};
 /// Largest JSON file kept in memory while reading an archive.
 const MAX_JSON: u64 = 4 << 20;
 
+struct IngestCleanup<'a> {
+    store: &'a Store,
+    before: Vec<Image>,
+    ingested: Vec<String>,
+}
+
+impl Drop for IngestCleanup<'_> {
+    fn drop(&mut self) {
+        if self.ingested.is_empty() {
+            return;
+        }
+        let now = self.store.images().unwrap_or_default();
+        let used = |d: &str| {
+            self.before.iter().chain(now.iter()).any(|i| i.config_digest == d || i.layers.iter().any(|l| l.digest == d))
+        };
+        for d in self.ingested.iter().filter(|d| !used(d)) {
+            if let Ok(path) = self.store.blob_path(d) {
+                let _ = std::fs::remove_file(path);
+            }
+        }
+    }
+}
+
 /// Reads an archive into the store. Returns the images it named.
 pub fn load(store: &Store, archive: impl Read) -> io::Result<Vec<Image>> {
     let mut tar = tar::Archive::new(archive);
     // Archive path → blob digest and size, for every regular file.
     let mut files: HashMap<String, (String, u64)> = HashMap::new();
     let mut manifest: Option<Vec<u8>> = None;
-    let before: Vec<Image> = store.images()?;
-    let existed = |d: &str| before.iter().any(|i| i.config_digest == d || i.layers.iter().any(|l| l.digest == d));
-    let mut ingested: Vec<String> = Vec::new();
+    let mut cleanup = IngestCleanup { store, before: store.images()?, ingested: Vec::new() };
     for entry in tar.entries()? {
         let mut entry = entry?;
         if !entry.header().entry_type().is_file() {
@@ -32,7 +53,10 @@ pub fn load(store: &Store, archive: impl Read) -> io::Result<Vec<Image>> {
         let path = entry.path()?.to_string_lossy().trim_start_matches("./").to_owned();
         if path == "manifest.json" {
             let mut buf = Vec::new();
-            (&mut entry).take(MAX_JSON).read_to_end(&mut buf)?;
+            (&mut entry).take(MAX_JSON + 1).read_to_end(&mut buf)?;
+            if buf.len() as u64 > MAX_JSON {
+                return Err(io::Error::new(io::ErrorKind::InvalidData, "manifest.json is too large"));
+            }
             manifest = Some(buf);
             continue;
         }
@@ -42,8 +66,8 @@ pub fn load(store: &Store, archive: impl Read) -> io::Result<Vec<Image>> {
         let mut w = store.ingest()?;
         io::copy(&mut entry, &mut w)?;
         let (digest, size) = w.finish()?;
-        if !existed(&digest) {
-            ingested.push(digest.clone());
+        if !cleanup.before.iter().any(|i| i.config_digest == digest || i.layers.iter().any(|l| l.digest == digest)) {
+            cleanup.ingested.push(digest.clone());
         }
         files.insert(path, (digest, size));
     }
@@ -76,13 +100,6 @@ pub fn load(store: &Store, archive: impl Read) -> io::Result<Vec<Image>> {
             loaded.push(image);
         }
     }
-    // Files no image uses (OCI index blobs and the like) do not stay.
-    let used = |d: &str| loaded.iter().any(|i| i.config_digest == d || i.layers.iter().any(|l| l.digest == d));
-    for d in ingested.iter().filter(|d| !used(d)) {
-        if let Ok(path) = store.blob_path(d) {
-            let _ = std::fs::remove_file(path);
-        }
-    }
     Ok(loaded)
 }
 
@@ -95,7 +112,11 @@ pub fn save(store: &Store, images: &[Image], out: impl Write) -> io::Result<()> 
     let mut by_config: Vec<(&Image, Vec<String>)> = Vec::new();
     for i in images {
         match by_config.iter_mut().find(|(first, _)| first.config_digest == i.config_digest) {
-            Some((_, tags)) => tags.push(i.name.clone()),
+            Some((_, tags)) => {
+                if !i.name.starts_with("sha256:") {
+                    tags.push(i.name.clone());
+                }
+            }
             None => by_config.push((i, if i.name.starts_with("sha256:") { vec![] } else { vec![i.name.clone()] })),
         }
     }
@@ -282,5 +303,42 @@ mod tests {
         assert_eq!(tagged("alpine"), "alpine:latest");
         assert_eq!(tagged("localhost:5000/app"), "localhost:5000/app:latest");
         assert_eq!(tagged("app:1"), "app:1");
+    }
+
+    #[test]
+    fn failed_loads_remove_ingested_blobs_and_save_skips_untagged_ids() {
+        let dir = scratch();
+        let store = Store::open(&dir).unwrap();
+        let mut b = tar::Builder::new(Vec::new());
+        for (name, body) in [("layer1.tar", &b"one"[..]), ("layer2.tar", &b"two"[..])] {
+            let mut h = tar::Header::new_ustar();
+            h.set_size(body.len() as u64);
+            h.set_mode(0o644);
+            h.set_entry_type(tar::EntryType::Regular);
+            b.append_data(&mut h, name, body).unwrap();
+        }
+        let no_manifest = b.into_inner().unwrap();
+        assert!(load(&store, no_manifest.as_slice()).is_err());
+        assert_eq!(std::fs::read_dir(dir.join("blobs/sha256")).unwrap().count(), 0);
+
+        let put = |bytes: &[u8]| {
+            let mut w = store.ingest().unwrap();
+            w.write_all(bytes).unwrap();
+            w.finish().unwrap()
+        };
+        let cfg = json!({"os": "linux", "architecture": "arm64", "config": {}});
+        let (cfg_digest, _) = put(&serde_json::to_vec(&cfg).unwrap());
+        let (layer, size) = put(b"layer");
+        let layers = vec![Layer { digest: layer, size, media_type: "application/vnd.oci.image.layer.v1.tar".into() }];
+        let named = from_config("demo:1".into(), &cfg_digest, &cfg, layers.clone());
+        let untagged = from_config(cfg_digest.clone(), &cfg_digest, &cfg, layers);
+        let mut tarball = Vec::new();
+        save(&store, &[named, untagged], &mut tarball).unwrap();
+
+        let other = Store::open(dir.join("other")).unwrap();
+        let loaded = load(&other, tarball.as_slice()).unwrap();
+        assert_eq!(loaded.len(), 1);
+        assert_eq!(loaded[0].name, "demo:1");
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 }
