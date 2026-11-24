@@ -163,8 +163,8 @@ fn mib(v: &str) -> Option<u64> {
     let digits = v.find(|c: char| !c.is_ascii_digit()).unwrap_or(v.len());
     let n: u64 = v[..digits].parse().ok()?;
     match v[digits..].trim().trim_end_matches('B') {
-        "T" => Some(n << 20),
-        "G" => Some(n << 10),
+        "T" => n.checked_mul(1 << 20),
+        "G" => n.checked_mul(1 << 10),
         "M" => Some(n),
         "K" => Some(n >> 10),
         "" => Some(n >> 20),
@@ -172,18 +172,26 @@ fn mib(v: &str) -> Option<u64> {
     }
 }
 
+fn uncomment(line: &str) -> &str {
+    line.trim_start_matches('\u{feff}').split(['#', ';']).next().unwrap_or_default().trim()
+}
+
+fn is_wsl2_header(l: &str) -> bool {
+    l.strip_prefix('[').and_then(|s| s.strip_suffix(']')).is_some_and(|s| s.trim().eq_ignore_ascii_case("wsl2"))
+}
+
 /// A key's value under `[wsl2]`.
 fn get(text: &str, key: &str) -> Option<String> {
-    let mut in_wsl2 = false;
+    let (mut in_wsl2, mut found) = (false, None);
     for line in text.lines() {
-        let l = line.trim();
+        let l = uncomment(line);
         if l.starts_with('[') {
-            in_wsl2 = l.eq_ignore_ascii_case("[wsl2]");
+            in_wsl2 = is_wsl2_header(l);
         } else if in_wsl2 && let Some((k, v)) = l.split_once('=') && k.trim().eq_ignore_ascii_case(key) {
-            return Some(v.split('#').next().unwrap_or_default().trim().to_owned());
+            found = Some(v.trim().to_owned());
         }
     }
-    None
+    found
 }
 
 /// The file with `key=value` under `[wsl2]`, replacing the key if it is
@@ -191,8 +199,8 @@ fn get(text: &str, key: &str) -> Option<String> {
 fn set(text: &str, key: &str, value: &str) -> String {
     let mut out: Vec<String> = Vec::new();
     let (mut in_wsl2, mut seen_wsl2, mut done) = (false, false, false);
-    for line in text.lines() {
-        let l = line.trim();
+    for line in text.strip_prefix('\u{feff}').unwrap_or(text).lines() {
+        let l = uncomment(line);
         if l.starts_with('[') {
             if in_wsl2 && !done {
                 // The section's end, after its last non-blank line.
@@ -200,23 +208,28 @@ fn set(text: &str, key: &str, value: &str) -> String {
                 out.insert(at, format!("{key}={value}"));
                 done = true;
             }
-            in_wsl2 = l.eq_ignore_ascii_case("[wsl2]");
+            in_wsl2 = is_wsl2_header(l);
             seen_wsl2 |= in_wsl2;
-        } else if in_wsl2 && !done && l.split_once('=').is_some_and(|(k, _)| k.trim().eq_ignore_ascii_case(key)) {
-            out.push(format!("{key}={value}"));
-            done = true;
+        } else if in_wsl2 && l.split_once('=').is_some_and(|(k, _)| k.trim().eq_ignore_ascii_case(key)) {
+            if !done {
+                out.push(format!("{key}={value}"));
+                done = true;
+            }
             continue;
         }
         out.push(line.to_owned());
     }
     if !done {
-        if !seen_wsl2 {
+        if seen_wsl2 {
+            let at = out.iter().rposition(|x| !x.trim().is_empty()).map_or(out.len(), |i| i + 1);
+            out.insert(at, format!("{key}={value}"));
+        } else {
             if out.last().is_some_and(|l| !l.trim().is_empty()) {
                 out.push(String::new());
             }
             out.push("[wsl2]".into());
+            out.push(format!("{key}={value}"));
         }
-        out.push(format!("{key}={value}"));
     }
     out.join("\r\n") + "\r\n"
 }
@@ -379,5 +392,17 @@ mod tests {
         assert_eq!(get(&t, "processors").as_deref(), Some("8"));
         assert_eq!(set("", "memory", "4GB"), "[wsl2]\r\nmemory=4GB\r\n");
         assert_eq!(set("[boot]\r\nx=1\r\n", "memory", "4GB"), "[boot]\r\nx=1\r\n\r\n[wsl2]\r\nmemory=4GB\r\n");
+    }
+
+    #[test]
+    fn handles_bom_comments_duplicates_and_overflow() {
+        let bom = "\u{feff}[ wsl2 ] # VM limits\r\n; comment\r\nmemory=5GB\r\nmemory=13GB ; active\r\n";
+        assert_eq!(get(bom, "memory").as_deref(), Some("13GB"));
+        assert_eq!(mib(&get(bom, "memory").unwrap()), Some(13312));
+        let updated = set(bom, "memory", "9GB");
+        assert_eq!(updated, "[ wsl2 ] # VM limits\r\n; comment\r\nmemory=9GB\r\n");
+        assert_eq!(get(&updated, "memory").as_deref(), Some("9GB"));
+        assert_eq!(mib("18014398509481984TB"), None);
+        assert_eq!(mib("18014398509481984GB"), None);
     }
 }
