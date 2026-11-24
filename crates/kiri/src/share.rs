@@ -387,9 +387,27 @@ struct Server {
 }
 
 fn parse_server(s: &str) -> (String, u16) {
-    let s = s.trim().trim_start_matches("https://").trim_end_matches('/');
+    let s = s.trim();
+    let s = if s.len() >= 8 && s[..8].eq_ignore_ascii_case("https://") { &s[8..] } else { s };
+    let s = s.trim_end_matches('/');
+    if let Some(rest) = s.strip_prefix('[')
+        && let Some((h, tail)) = rest.split_once(']')
+        && !h.is_empty()
+    {
+        if tail.is_empty() {
+            return (h.to_ascii_lowercase(), 443);
+        }
+        if let Some(p) = tail.strip_prefix(':')
+            && !p.is_empty()
+            && p.bytes().all(|b| b.is_ascii_digit())
+        {
+            return (h.to_ascii_lowercase(), p.parse().ok().filter(|&n| n > 0).unwrap_or(443));
+        }
+    }
     match s.rsplit_once(':') {
-        Some((h, p)) if !h.is_empty() && !p.is_empty() && p.bytes().all(|b| b.is_ascii_digit()) => (h.to_ascii_lowercase(), p.parse().unwrap_or(443)),
+        Some((h, p)) if !h.is_empty() && !h.contains(':') && !p.is_empty() && p.bytes().all(|b| b.is_ascii_digit()) => {
+            (h.to_ascii_lowercase(), p.parse().ok().filter(|&n| n > 0).unwrap_or(443))
+        }
         _ => (s.to_ascii_lowercase(), 443),
     }
 }
@@ -397,7 +415,13 @@ fn parse_server(s: &str) -> (String, u16) {
 fn server(cfg: &Config) -> Server {
     let raw = std::env::var("KIRI_SHARE_SERVER").ok().or_else(|| cfg.server.clone()).unwrap_or_else(|| DEFAULT_SERVER.to_owned());
     let (host, port) = parse_server(&raw);
-    let dial = std::env::var("KIRI_SHARE_CONNECT").unwrap_or_else(|_| format!("{host}:{port}"));
+    let dial = std::env::var("KIRI_SHARE_CONNECT").unwrap_or_else(|_| {
+        if host.contains(':') {
+            format!("[{host}]:{port}")
+        } else {
+            format!("{host}:{port}")
+        }
+    });
     Server { host, port, dial }
 }
 
@@ -492,15 +516,27 @@ fn dial(srv: &Server, alpn: &[u8]) -> io::Result<(TcpStream, rustls::ClientConne
 
 /// One HTTPS request to the edge's API. Returns the status and JSON body.
 fn api(srv: &Server, method: &str, path: &str, body: Option<&Value>, token: Option<&str>) -> io::Result<(u16, Value)> {
+    if path.bytes().any(|b| b <= b' ' || b == 0x7f) {
+        return Err(io::Error::new(io::ErrorKind::InvalidInput, "invalid share API path"));
+    }
+    let auth = match token.map(str::trim).filter(|t| !t.is_empty()) {
+        Some(t) if t.contains(['\r', '\n', '\0']) => {
+            return Err(io::Error::new(io::ErrorKind::InvalidInput, "invalid share token"));
+        }
+        Some(t) => format!("Authorization: Bearer {t}\r\n"),
+        None => String::new(),
+    };
+    let host_hdr = if srv.host.contains(':') { format!("[{}]", srv.host) } else { srv.host.clone() };
+    if host_hdr.bytes().any(|b| b <= b' ' || b == 0x7f) {
+        return Err(io::Error::new(io::ErrorKind::InvalidInput, "invalid share server host"));
+    }
     let (sock, conn) = dial(srv, b"http/1.1")?;
     sock.set_read_timeout(Some(Duration::from_secs(30)))?;
     let mut s = rustls::StreamOwned::new(conn, sock);
     let payload = body.map(Value::to_string).unwrap_or_default();
-    let auth = token.map(|t| format!("Authorization: Bearer {t}\r\n")).unwrap_or_default();
     write!(
         s,
-        "{method} {path} HTTP/1.1\r\nHost: {}\r\nUser-Agent: kiri/{}\r\nAccept: application/json\r\n{auth}Content-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{payload}",
-        srv.host,
+        "{method} {path} HTTP/1.1\r\nHost: {host_hdr}\r\nUser-Agent: kiri/{}\r\nAccept: application/json\r\n{auth}Content-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{payload}",
         env!("CARGO_PKG_VERSION"),
         payload.len()
     )?;
@@ -520,11 +556,42 @@ fn parse_http_response(raw: &[u8]) -> io::Result<(u16, Value)> {
     let split = raw.windows(4).position(|w| w == b"\r\n\r\n").ok_or_else(bad)?;
     let head = std::str::from_utf8(&raw[..split]).map_err(|_| bad())?;
     let status = parse_status_line(head.as_bytes()).ok_or_else(bad)?;
-    let mut body = raw[split + 4..].to_vec();
-    if head.lines().any(|l| l.to_ascii_lowercase().replace(' ', "") == "transfer-encoding:chunked") {
-        body = dechunk(&body).ok_or_else(bad)?;
+    let mut is_chunked = false;
+    let mut content_length: Option<usize> = None;
+    for line in head.lines().skip(1) {
+        let Some((name, val)) = line.split_once(':') else { continue };
+        let name = name.trim_matches([' ', '\t']);
+        if name.eq_ignore_ascii_case("transfer-encoding") {
+            if val.split(',').any(|t| t.trim_matches([' ', '\t']).eq_ignore_ascii_case("chunked")) {
+                is_chunked = true;
+            }
+        } else if name.eq_ignore_ascii_case("content-length") {
+            let n = val.trim_matches([' ', '\t']).parse::<usize>().map_err(|_| bad())?;
+            if content_length.replace(n).is_some_and(|prev| prev != n) {
+                return Err(bad());
+            }
+        }
     }
-    Ok((status, serde_json::from_slice(&body).unwrap_or(Value::Null)))
+    if is_chunked && content_length.is_some() {
+        return Err(bad());
+    }
+    let mut body = raw[split + 4..].to_vec();
+    if is_chunked {
+        body = dechunk(&body).ok_or_else(bad)?;
+    } else if let Some(cl) = content_length {
+        if body.len() < cl {
+            return Err(bad());
+        }
+        body.truncate(cl);
+    }
+    if body.trim_ascii().is_empty() {
+        return Ok((status, Value::Null));
+    }
+    match serde_json::from_slice(&body) {
+        Ok(v) => Ok((status, v)),
+        Err(_) if (200..300).contains(&status) => Err(bad()),
+        Err(_) => Ok((status, Value::Null)),
+    }
 }
 
 fn dechunk(mut b: &[u8]) -> Option<Vec<u8>> {
@@ -532,13 +599,24 @@ fn dechunk(mut b: &[u8]) -> Option<Vec<u8>> {
     loop {
         let line_end = b.windows(2).position(|w| w == b"\r\n")?;
         let size_str = std::str::from_utf8(&b[..line_end]).ok()?;
-        let size = usize::from_str_radix(size_str.split(';').next()?.trim(), 16).ok()?;
+        let hex = size_str.split(';').next()?.trim_matches([' ', '\t']);
+        if hex.is_empty() || !hex.bytes().all(|c| c.is_ascii_hexdigit()) {
+            return None;
+        }
+        let size = usize::from_str_radix(hex, 16).ok()?;
         b = &b[line_end + 2..];
         if size == 0 {
-            return Some(out);
+            if b.starts_with(b"\r\n") || b.windows(4).any(|w| w == b"\r\n\r\n") {
+                return Some(out);
+            }
+            return None;
         }
-        out.extend_from_slice(b.get(..size)?);
-        b = b.get(size + 2..)?;
+        let end = size.checked_add(2)?;
+        if b.len() < end || &b[size..end] != b"\r\n" {
+            return None;
+        }
+        out.extend_from_slice(&b[..size]);
+        b = &b[end..];
     }
 }
 
@@ -734,7 +812,18 @@ pub fn reserve(name: &str) -> io::Result<ReservedName> {
     }
 }
 
+fn is_valid_share_name(name: &str) -> bool {
+    !name.is_empty()
+        && name.len() <= 63
+        && !name.starts_with('-')
+        && !name.ends_with('-')
+        && name.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-')
+}
+
 pub fn release(name: &str) -> io::Result<()> {
+    if !is_valid_share_name(name) {
+        return Err(io::Error::new(io::ErrorKind::InvalidInput, format!("`{name}` isn't a valid reserved name")));
+    }
     let (status, v) = signed_in("DELETE", &format!("/v1/names/{}", name.to_ascii_lowercase()), None)?;
     match status {
         200 | 204 => Ok(()),
@@ -801,7 +890,10 @@ pub fn tunnels() -> io::Result<LiveTunnels> {
 /// Closes one of the account's tunnels, wherever it runs. The edge tells
 /// the computer running it that it was stopped from this one.
 pub fn close_tunnel(name: &str) -> io::Result<()> {
-    let (status, v) = signed_in("DELETE", &format!("/v1/tunnels/{name}"), Some(&json!({ "host": host_name() })))?;
+    if !is_valid_share_name(name) {
+        return Err(io::Error::new(io::ErrorKind::InvalidInput, format!("`{name}` isn't a valid tunnel name")));
+    }
+    let (status, v) = signed_in("DELETE", &format!("/v1/tunnels/{}", name.to_ascii_lowercase()), Some(&json!({ "host": host_name() })))?;
     match status {
         200 | 204 => Ok(()),
         404 => Err(io::Error::other(format!("{name} isn't live any more"))),
@@ -830,6 +922,9 @@ enum AutoReserve {
 /// exact address. Never stops the tunnel: any failure just leaves the edge to
 /// pick the address as before.
 fn auto_reserve(name: &str) -> io::Result<AutoReserve> {
+    if !is_valid_share_name(name) {
+        return Ok(AutoReserve::Unavailable);
+    }
     let name = name.to_ascii_lowercase();
     let mine = names()?;
     if let Some(n) = mine.items.iter().find(|n| n.name == name) {
@@ -911,12 +1006,20 @@ fn port_or_addr(arg: &str) -> Option<Target> {
         let addr = format!("localhost:{port}");
         return Some(Target { addr: addr.clone(), label: String::new(), display: addr });
     }
-    let (host, port) = arg.rsplit_once(':')?;
-    let port: u16 = port.parse().ok().filter(|p| *p > 0)?;
-    let host = host.trim_start_matches('[').trim_end_matches(']');
-    if host.is_empty() {
-        return None;
-    }
+    let (host, port_str) = if let Some(rest) = arg.strip_prefix('[') {
+        let (h, p) = rest.split_once("]:")?;
+        if h.is_empty() || h.contains(['[', ']']) || h.parse::<std::net::Ipv6Addr>().is_err() {
+            return None;
+        }
+        (h, p)
+    } else {
+        let (h, p) = arg.rsplit_once(':')?;
+        if h.is_empty() || h.contains([':', '[', ']']) {
+            return None;
+        }
+        (h, p)
+    };
+    let port: u16 = port_str.parse().ok().filter(|p| *p > 0)?;
     let local = matches!(host, "localhost" | "127.0.0.1" | "::1" | "0.0.0.0");
     let label = if local || host.parse::<std::net::IpAddr>().is_ok() { String::new() } else { host.split('.').next().unwrap_or("").to_owned() };
     let addr = if host.contains(':') { format!("[{host}]:{port}") } else { format!("{host}:{port}") };
@@ -931,8 +1034,9 @@ fn published_port(inspect: &Value) -> Option<String> {
     for (key, bindings) in ports {
         let Some(cport) = key.strip_suffix("/tcp").and_then(|p| p.parse::<u16>().ok()) else { continue };
         for b in bindings.as_array().into_iter().flatten() {
-            let Some(hport) = b["HostPort"].as_str().filter(|p| !p.is_empty()) else { continue };
-            let host = match b["HostIp"].as_str().unwrap_or("") {
+            let Some(hport) = b["HostPort"].as_str().and_then(|p| p.parse::<u16>().ok()).filter(|&p| p > 0) else { continue };
+            let raw_ip = b["HostIp"].as_str().unwrap_or("").trim_start_matches('[').trim_end_matches(']');
+            let host = match raw_ip {
                 "" | "0.0.0.0" | "::" => "localhost".to_owned(),
                 ip if ip.contains(':') => format!("[{ip}]"),
                 ip => ip.to_owned(),
@@ -2644,5 +2748,40 @@ mod tests {
         assert!(!leftover_tmp());
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn validates_http_framing_ipv6_endpoints_and_tunnel_names() {
+        // Truncated Content-Length, truncated 2xx JSON, and malformed chunked framing are rejected.
+        assert!(parse_http_response(b"HTTP/1.1 200 OK\r\nContent-Length: 50\r\n\r\n{\"ok\":true}").is_err());
+        assert!(parse_http_response(b"HTTP/1.1 200 OK\r\n\r\n{\"ok\":").is_err());
+        assert!(parse_http_response(b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n2\r\n{}XX0\r\n\r\n").is_err());
+        assert!(parse_http_response(b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n2\r\n{}\r\n0\r\n").is_err());
+        assert!(parse_http_response(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nTransfer-Encoding: chunked\r\n\r\n2\r\n{}\r\n0\r\n\r\n").is_err());
+
+        // Tab OWS and transfer-coding lists decode cleanly; non-2xx HTML surfaces status with Null body.
+        let (s, v) = parse_http_response(b"HTTP/1.1 200 OK\r\nTransfer-Encoding:\tchunked\r\n\r\nb;ext=1\r\n{\"ok\":true}\r\n0\r\n\r\n").unwrap();
+        assert_eq!((s, v["ok"].as_bool()), (200, Some(true)));
+        let (s, v) = parse_http_response(b"HTTP/1.1 200 OK\r\nTransfer-Encoding: identity, chunked\r\n\r\nb\r\n{\"ok\":true}\r\n0\r\n\r\n").unwrap();
+        assert_eq!((s, v["ok"].as_bool()), (200, Some(true)));
+        let (s, v) = parse_http_response(b"HTTP/1.1 502 Bad Gateway\r\nContent-Length: 16\r\n\r\n<html>bad</html>").unwrap();
+        assert_eq!((s, v), (502, Value::Null));
+        let (s, v) = parse_http_response(b"HTTP/1.1 204 No Content\r\nContent-Length: 0\r\n\r\n").unwrap();
+        assert_eq!((s, v), (204, Value::Null));
+
+        // IPv6 server and target parsing.
+        assert_eq!(parse_server("HTTPS://[::1]:8443/"), ("::1".into(), 8443));
+        assert_eq!(parse_server("[2001:db8::1]"), ("2001:db8::1".into(), 443));
+        assert_eq!(parse_server("::1"), ("::1".into(), 443));
+        assert!(!is_shorthand("::1") && !is_shorthand("2001:db8::1") && !is_shorthand("[::1]") && !is_shorthand("[[::1]]:3000"));
+        assert!(is_shorthand("[::1]:3000") && is_shorthand("[2001:db8::1]:8443"));
+
+        // Invalid tunnel/reserved names fail locally before touching config or network.
+        for bad in ["", "../tunnels/prod", "a/b", "my app", "bad\r\nX: 1", "-bad", "bad-", &"a".repeat(64)] {
+            assert!(!is_valid_share_name(bad));
+            assert!(release(bad).is_err());
+            assert!(close_tunnel(bad).is_err());
+        }
+        assert!(is_valid_share_name("acme-shop") && is_valid_share_name("api-7fq2ab"));
     }
 }
