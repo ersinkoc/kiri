@@ -55,17 +55,72 @@ pub struct Release {
     pub notes_url: String,
 }
 
-/// `1.2.10` > `1.2.9`; a missing part counts as 0.
+fn parse_version(v: &str) -> Option<(Vec<u64>, Option<Vec<&str>>)> {
+    let s = v.strip_prefix('v').unwrap_or(v);
+    let (core, pre) = match s.split_once('-') {
+        Some((c, p)) => (c, Some(p)),
+        None => (s, None),
+    };
+    if core.is_empty() {
+        return None;
+    }
+    let mut nums = Vec::new();
+    for seg in core.split('.') {
+        if seg.is_empty() || !seg.bytes().all(|b| b.is_ascii_digit()) {
+            return None;
+        }
+        nums.push(seg.parse::<u64>().ok()?);
+    }
+    let pre_ids = match pre {
+        Some(p) => {
+            if p.is_empty() {
+                return None;
+            }
+            let mut ids = Vec::new();
+            for id in p.split('.') {
+                if id.is_empty() || !id.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-') {
+                    return None;
+                }
+                ids.push(id);
+            }
+            Some(ids)
+        }
+        None => None,
+    };
+    Some((nums, pre_ids))
+}
+
+/// `1.2.10` > `1.2.9` and `1.2.0` > `1.2.0-rc.1`; invalid version strings are never newer.
 pub fn newer(candidate: &str, current: &str) -> bool {
-    let parts = |v: &str| -> Vec<u64> { v.trim_start_matches('v').split(['.', '-']).map(|p| p.parse().unwrap_or(0)).collect() };
-    let (a, b) = (parts(candidate), parts(current));
-    for i in 0..a.len().max(b.len()) {
-        let (x, y) = (a.get(i).copied().unwrap_or(0), b.get(i).copied().unwrap_or(0));
+    let (Some((ca, pa)), Some((cb, pb))) = (parse_version(candidate), parse_version(current)) else {
+        return false;
+    };
+    for i in 0..ca.len().max(cb.len()) {
+        let (x, y) = (ca.get(i).copied().unwrap_or(0), cb.get(i).copied().unwrap_or(0));
         if x != y {
             return x > y;
         }
     }
-    false
+    match (pa, pb) {
+        (None, Some(_)) => true,
+        (Some(_), None) | (None, None) => false,
+        (Some(a), Some(b)) => {
+            for (ia, ib) in a.iter().zip(b.iter()) {
+                if ia == ib {
+                    continue;
+                }
+                let na = ia.bytes().all(|c| c.is_ascii_digit()).then(|| ia.parse::<u64>().ok()).flatten();
+                let nb = ib.bytes().all(|c| c.is_ascii_digit()).then(|| ib.parse::<u64>().ok()).flatten();
+                return match (na, nb) {
+                    (Some(x), Some(y)) => x > y,
+                    (Some(_), None) => false,
+                    (None, Some(_)) => true,
+                    (None, None) => ia > ib,
+                };
+            }
+            a.len() > b.len()
+        }
+    }
 }
 
 /// The same guard the registry client (`kiri-image/src/connect.rs`) uses: a
@@ -563,8 +618,22 @@ mod tests {
         assert!(newer("0.2.0", "0.1.9"));
         assert!(newer("1.2.10", "1.2.9"));
         assert!(newer("v1.0.1", "1.0"));
+        assert!(!newer("1.0.0", "1.0"));
         assert!(!newer("0.1.0", "0.1.0"));
         assert!(!newer("0.1.0", "0.2.0"));
+        // SemVer pre-releases sort below the corresponding final release.
+        let ladder = ["0.1.9", "0.2.0-1", "0.2.0-beta.1", "0.2.0-dev.42", "0.2.0-rc.1", "0.2.0-rc.2", "0.2.0-rc.10", "0.2.0"];
+        for (i, low) in ladder.iter().enumerate() {
+            assert!(!newer(low, low));
+            for high in &ladder[i + 1..] {
+                assert!(newer(high, low), "{high} should be newer than {low}");
+                assert!(!newer(low, high), "{low} should not be newer than {high}");
+            }
+        }
+        for bad in ["", "vv1.0.0", "1.+2.0", "1.2.", "1.2.0-", "1.2.0-rc..1", "99.0.0/../../evil", "99.0.0\\evil"] {
+            assert!(!newer(bad, "0.2.0"), "accepted invalid candidate {bad:?}");
+            assert!(!newer("99.0.0", bad), "accepted invalid current {bad:?}");
+        }
     }
 
     #[test]
