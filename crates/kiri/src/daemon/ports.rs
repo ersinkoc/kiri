@@ -282,8 +282,13 @@ pub fn parse_ipconfig_addrs(output: &str) -> BTreeSet<IpAddr> {
         IpAddr::V4(std::net::Ipv4Addr::LOCALHOST),
         IpAddr::V6(std::net::Ipv6Addr::LOCALHOST),
     ]);
+    let is_ipv4_netmask = |v4: std::net::Ipv4Addr| {
+        let m = u32::from(v4);
+        m >= 0x8000_0000 && (!m).wrapping_add(1).is_power_of_two()
+    };
     let mut pending_v4: Option<std::net::Ipv4Addr> = None;
-    let mut seen_mask_in_section = false;
+    let mut v6_closed_in_section = false;
+    let mut after_link_local = false;
     for raw_line in output.lines() {
         let line = raw_line.trim();
         if line.is_empty() {
@@ -292,8 +297,13 @@ pub fn parse_ipconfig_addrs(output: &str) -> BTreeSet<IpAddr> {
         // Adapter section header (e.g. `Ethernet adapter vEthernet (WSL):`).
         if line.ends_with(':') && !line.contains(". :") && !line.contains(" : ") {
             pending_v4 = None;
-            seen_mask_in_section = false;
+            v6_closed_in_section = false;
+            after_link_local = false;
             continue;
+        }
+        let has_label = line.contains(": ") || line.ends_with(':');
+        if has_label && after_link_local {
+            v6_closed_in_section = true;
         }
         let val = match line.split_once(": ") {
             Some((_, right)) => right.trim(),
@@ -307,8 +317,8 @@ pub fn parse_ipconfig_addrs(output: &str) -> BTreeSet<IpAddr> {
             continue;
         }
         if let Ok(v4) = token.parse::<std::net::Ipv4Addr>() {
-            if v4.octets()[0] == 255 {
-                seen_mask_in_section = true;
+            if is_ipv4_netmask(v4) {
+                v6_closed_in_section = true;
                 if let Some(interface_ip) = pending_v4.take()
                     && !interface_ip.is_unspecified()
                     && !interface_ip.is_multicast()
@@ -318,11 +328,14 @@ pub fn parse_ipconfig_addrs(output: &str) -> BTreeSet<IpAddr> {
             } else {
                 pending_v4 = Some(v4);
             }
-        } else if !seen_mask_in_section
+        } else if !v6_closed_in_section
             && let Some(IpAddr::V6(v6)) = parse_host_ip(token)
             && !v6.is_unspecified()
             && !v6.is_multicast()
         {
+            if (v6.segments()[0] & 0xffc0) == 0xfe80 {
+                after_link_local = true;
+            }
             set.insert(IpAddr::V6(v6));
         }
     }
@@ -1648,14 +1661,65 @@ pub fn has_active_network_extension(plist: &[u8]) -> bool {
     }
 }
 
+#[cfg_attr(not(any(target_os = "macos", test)), allow(dead_code))]
+fn xml_extensions_array(xml: &str) -> &str {
+    let mut depth = 0usize;
+    let mut start = None;
+    let mut i = 0;
+    let bytes = xml.as_bytes();
+    while i < bytes.len() {
+        if bytes[i] == b'<' {
+            if let Some((len, self_closing)) = xml_tag_len(&xml[i..], "array") {
+                if self_closing {
+                    if depth == 0 {
+                        return "";
+                    }
+                } else {
+                    depth += 1;
+                    if depth == 1 {
+                        start = Some(i);
+                    }
+                }
+                i += len;
+                continue;
+            } else if xml[i..].starts_with("</array>") {
+                if depth == 1
+                    && let Some(s) = start
+                {
+                    return &xml[s..i + 8];
+                }
+                depth = depth.saturating_sub(1);
+                i += 8;
+                continue;
+            }
+        }
+        i += 1;
+    }
+    xml
+}
+
+#[cfg_attr(not(any(target_os = "macos", test)), allow(dead_code))]
+fn xml_tag_len(s: &str, name: &str) -> Option<(usize, bool)> {
+    let rest = s.strip_prefix('<')?.strip_prefix(name)?;
+    match rest.as_bytes().first().copied()? {
+        b'>' => Some((name.len() + 2, false)),
+        b'/' if rest.starts_with("/>") => Some((name.len() + 3, true)),
+        b' ' | b'\t' | b'\r' | b'\n' => {
+            let end = s.find('>')?;
+            Some((end + 1, s[..end].trim_end().ends_with('/')))
+        }
+        _ => None,
+    }
+}
+
 fn has_active_network_extension_xml(xml: &str) -> bool {
     // Walk top-level <dict> entries inside <key>extensions</key><array>...</array>
     // (or any <dict> if the snippet is not wrapped in <key>extensions</key>).
-    let scope = match xml.find("<key>extensions</key>") {
-        Some(idx) => &xml[idx..],
-        None => xml,
+    let dicts = match xml.find("<key>extensions</key>") {
+        Some(idx) => xml_extension_dicts_at(xml_extensions_array(&xml[idx + "<key>extensions</key>".len()..]), 1),
+        None => xml_extension_dicts(xml),
     };
-    for dict in xml_extension_dicts(scope) {
+    for dict in dicts {
         let Some(id) = xml_key_string(dict, "identifier") else { continue };
         let Some(state) = xml_key_string(dict, "state") else { continue };
         if state != "activated_enabled" || id.is_empty() || id.starts_with("com.apple.") {
@@ -1678,34 +1742,8 @@ fn has_active_network_extension_xml(xml: &str) -> bool {
 /// nested `<dict>` depth so sub-dictionaries (`bundleVersion`, `container`,
 /// `stagedBundleURL`) stay inside their parent extension block.
 fn xml_extension_dicts(xml: &str) -> Vec<&str> {
-    let mut out = Vec::new();
     let base_depth = if xml.trim_start().starts_with("<key>extensions</key>") { 1 } else { 2 };
-    let mut depth = 0usize;
-    let mut start: Option<usize> = None;
-    let mut i = 0;
-    let bytes = xml.as_bytes();
-    while i < bytes.len() {
-        if bytes[i] == b'<' {
-            if xml[i..].starts_with("<dict>") || xml[i..].starts_with("<dict ") {
-                depth += 1;
-                if depth == base_depth && start.is_none() {
-                    start = Some(i);
-                }
-                i += 6;
-                continue;
-            } else if xml[i..].starts_with("</dict>") {
-                if depth == base_depth
-                    && let Some(s) = start.take()
-                {
-                    out.push(&xml[s..i + 7]);
-                }
-                depth = depth.saturating_sub(1);
-                i += 7;
-                continue;
-            }
-        }
-        i += 1;
-    }
+    let out = xml_extension_dicts_at(xml, base_depth);
     if out.is_empty() && base_depth == 2 {
         // Fallback for a bare `<dict>...</dict>` fixture at depth 1.
         return xml_extension_dicts_at(xml, 1);
@@ -1721,12 +1759,18 @@ fn xml_extension_dicts_at(xml: &str, target_depth: usize) -> Vec<&str> {
     let bytes = xml.as_bytes();
     while i < bytes.len() {
         if bytes[i] == b'<' {
-            if xml[i..].starts_with("<dict>") || xml[i..].starts_with("<dict ") {
-                depth += 1;
-                if depth == target_depth && start.is_none() {
-                    start = Some(i);
+            if let Some((len, self_closing)) = xml_tag_len(&xml[i..], "dict") {
+                if self_closing {
+                    if depth + 1 == target_depth && start.is_none() {
+                        out.push(&xml[i..i + len]);
+                    }
+                } else {
+                    depth += 1;
+                    if depth == target_depth && start.is_none() {
+                        start = Some(i);
+                    }
                 }
-                i += 6;
+                i += len;
                 continue;
             } else if xml[i..].starts_with("</dict>") {
                 if depth == target_depth
@@ -2692,5 +2736,61 @@ Wireless LAN adapter Wi-Fi:\r\n\
         assert!(!ips.contains(&"192.0.2.1".parse().unwrap()));
         assert!(!ips.contains(&"fe80::1".parse().unwrap()));
         assert!(!ips.contains(&"203.0.113.99".parse().unwrap()));
+    }
+
+    #[test]
+    fn ipconfig_and_plist_parsers_handle_ipv6_only_gateways_wide_masks_and_self_closing_dicts() {
+        let v6_and_wide_mask = "\
+Windows IP Configuration\r\n\
+\r\n\
+Wireless LAN adapter Wi-Fi:\r\n\
+\r\n\
+   Connection-specific DNS Suffix  . : ipv6.lan\r\n\
+   IPv6 Address. . . . . . . . . . . : 2001:db8:10::55(Preferred)\r\n\
+   Link-local IPv6 Address . . . . . : fe80::55%12\r\n\
+   Default Gateway . . . . . . . . . : fe80::1%12\r\n\
+                                       2001:db8:10::1\r\n\
+\r\n\
+Ethernet adapter Ethernet:\r\n\
+\r\n\
+   IPv4 Address. . . . . . . . . . . : 10.0.0.42(Preferred)\r\n\
+   Subnet Mask . . . . . . . . . . . : 254.0.0.0\r\n\
+   Default Gateway . . . . . . . . . : 10.0.0.1\r\n";
+        let ips = super::parse_ipconfig_addrs(v6_and_wide_mask);
+        assert!(ips.contains(&"2001:db8:10::55".parse().unwrap()));
+        assert!(ips.contains(&"fe80::55".parse().unwrap()));
+        assert!(ips.contains(&"10.0.0.42".parse().unwrap()));
+        assert!(!ips.contains(&"fe80::1".parse().unwrap()));
+        assert!(!ips.contains(&"2001:db8:10::1".parse().unwrap()));
+        assert!(!ips.contains(&"254.0.0.0".parse().unwrap()));
+        assert!(!ips.contains(&"10.0.0.1".parse().unwrap()));
+
+        let with_self_closing_dict = br#"<?xml version="1.0" encoding="UTF-8"?>
+<plist version="1.0">
+<dict>
+    <key>extensions</key>
+    <array>
+        <dict>
+            <key>additionalLaunchdPlistEntries</key>
+            <dict />
+            <key>categories</key>
+            <array><string>com.apple.system_extension.network_extension</string></array>
+            <key>identifier</key>
+            <string>io.tailscale.ipn.macsys.network-extension</string>
+            <key>state</key>
+            <string>activated_enabled</string>
+        </dict>
+        <dict>
+            <key>categories</key>
+            <array><string>com.apple.system_extension.network_extension</string></array>
+            <key>identifier</key>
+            <string>com.kaspersky.kav.sysext</string>
+            <key>state</key>
+            <string>activated_enabled</string>
+        </dict>
+    </array>
+</dict>
+</plist>"#;
+        assert!(super::has_active_network_extension(with_self_closing_dict));
     }
 }
