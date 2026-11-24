@@ -66,17 +66,72 @@ pub struct Release {
     pub size: u64,
 }
 
-/// `1.2.10` > `1.2.9`; a missing part counts as 0.
+fn parse_version(v: &str) -> Option<(Vec<u64>, Option<Vec<&str>>)> {
+    let s = v.strip_prefix('v').unwrap_or(v);
+    let (core, pre) = match s.split_once('-') {
+        Some((c, p)) => (c, Some(p)),
+        None => (s, None),
+    };
+    if core.is_empty() {
+        return None;
+    }
+    let mut nums = Vec::new();
+    for seg in core.split('.') {
+        if seg.is_empty() || !seg.bytes().all(|b| b.is_ascii_digit()) {
+            return None;
+        }
+        nums.push(seg.parse::<u64>().ok()?);
+    }
+    let pre_ids = match pre {
+        Some(p) => {
+            if p.is_empty() {
+                return None;
+            }
+            let mut ids = Vec::new();
+            for id in p.split('.') {
+                if id.is_empty() || !id.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-') {
+                    return None;
+                }
+                ids.push(id);
+            }
+            Some(ids)
+        }
+        None => None,
+    };
+    Some((nums, pre_ids))
+}
+
+/// `1.2.10` > `1.2.9` and `1.2.0` > `1.2.0-rc.1`; invalid version strings are never newer.
 pub fn newer(candidate: &str, current: &str) -> bool {
-    let parts = |v: &str| -> Vec<u64> { v.trim_start_matches('v').split(['.', '-']).map(|p| p.parse().unwrap_or(0)).collect() };
-    let (a, b) = (parts(candidate), parts(current));
-    for i in 0..a.len().max(b.len()) {
-        let (x, y) = (a.get(i).copied().unwrap_or(0), b.get(i).copied().unwrap_or(0));
+    let (Some((ca, pa)), Some((cb, pb))) = (parse_version(candidate), parse_version(current)) else {
+        return false;
+    };
+    for i in 0..ca.len().max(cb.len()) {
+        let (x, y) = (ca.get(i).copied().unwrap_or(0), cb.get(i).copied().unwrap_or(0));
         if x != y {
             return x > y;
         }
     }
-    false
+    match (pa, pb) {
+        (None, Some(_)) => true,
+        (Some(_), None) | (None, None) => false,
+        (Some(a), Some(b)) => {
+            for (ia, ib) in a.iter().zip(b.iter()) {
+                if ia == ib {
+                    continue;
+                }
+                let na = ia.bytes().all(|c| c.is_ascii_digit()).then(|| ia.parse::<u64>().ok()).flatten();
+                let nb = ib.bytes().all(|c| c.is_ascii_digit()).then(|| ib.parse::<u64>().ok()).flatten();
+                return match (na, nb) {
+                    (Some(x), Some(y)) => x > y,
+                    (Some(_), None) => false,
+                    (None, Some(_)) => true,
+                    (None, None) => ia > ib,
+                };
+            }
+            a.len() > b.len()
+        }
+    }
 }
 
 /// %LOCALAPPDATA%\Kiri, where the MSI installs and kiri-win keeps its state.
@@ -169,6 +224,7 @@ fn fetch_and_check(release: &Release, dir: &Path, progress: &mut dyn FnMut(u64, 
     loop {
         if cancel.load(Ordering::Relaxed) {
             let _ = child.kill();
+            let _ = child.wait();
             return Err(io::Error::new(io::ErrorKind::Interrupted, "cancelled"));
         }
         let got = std::fs::metadata(&part).map_or(0, |m| m.len());
@@ -207,10 +263,15 @@ fn staged_msi(version: &str) -> PathBuf {
     stage_dir().join(format!("Kiri-{version}.msi"))
 }
 
+fn staged_in(dir: &Path) -> Option<String> {
+    let raw = std::fs::read_to_string(dir.join("version")).ok()?;
+    let version = raw.trim().strip_prefix('v').unwrap_or(raw.trim()).to_owned();
+    (parse_version(&version).is_some() && dir.join(format!("Kiri-{version}.msi")).is_file() && newer(&version, CURRENT)).then_some(version)
+}
+
 /// The staged update's version, when there is one newer than this build.
 pub fn staged() -> Option<String> {
-    let version = std::fs::read_to_string(stage_dir().join("version")).ok()?.trim().to_owned();
-    (staged_msi(&version).is_file() && newer(&version, CURRENT)).then_some(version)
+    staged_in(&stage_dir())
 }
 
 /// The staged MSI, checked again (it sat on disk since the download).
@@ -623,6 +684,17 @@ pub(crate) fn output_within(cmd: &mut Command, limit: Duration) -> io::Result<st
     use std::os::windows::io::AsRawHandle;
     use windows_sys::Win32::Foundation::{WAIT_OBJECT_0, WAIT_TIMEOUT};
     let mut child = cmd.stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::piped()).spawn()?;
+    let drain = |pipe: Option<Box<dyn Read + Send>>| {
+        std::thread::spawn(move || {
+            let mut buf = Vec::new();
+            if let Some(mut r) = pipe {
+                let _ = r.read_to_end(&mut buf);
+            }
+            buf
+        })
+    };
+    let out_reader = drain(child.stdout.take().map(|s| Box::new(s) as Box<dyn Read + Send>));
+    let err_reader = drain(child.stderr.take().map(|s| Box::new(s) as Box<dyn Read + Send>));
     let ms = u32::try_from(limit.as_millis()).unwrap_or(u32::MAX - 1);
     // SAFETY: waits on the child's own process handle, open while `child` lives.
     let waited = unsafe { windows_sys::Win32::System::Threading::WaitForSingleObject(child.as_raw_handle() as _, ms) };
@@ -632,10 +704,15 @@ pub(crate) fn output_within(cmd: &mut Command, limit: Duration) -> io::Result<st
         return Err(io::Error::new(io::ErrorKind::TimedOut, format!("WSL did not finish in {} s", limit.as_secs())));
     }
     if waited != WAIT_OBJECT_0 {
-        return Err(io::Error::last_os_error());
+        let err = io::Error::last_os_error();
+        let _ = child.kill();
+        let _ = child.wait();
+        return Err(err);
     }
-    // It has exited: what it wrote (a line or two) is in the pipes.
-    child.wait_with_output()
+    let status = child.wait()?;
+    let stdout = out_reader.join().unwrap_or_default();
+    let stderr = err_reader.join().unwrap_or_default();
+    Ok(std::process::Output { status, stdout, stderr })
 }
 
 /// The engine's own Kiri version, when it answers.
@@ -705,8 +782,49 @@ mod tests {
         assert!(newer("0.2.0", "0.1.9"));
         assert!(newer("1.2.10", "1.2.9"));
         assert!(newer("v1.0.1", "1.0"));
+        assert!(!newer("1.0.0", "1.0"));
         assert!(!newer("0.1.0", "0.1.0"));
         assert!(!newer("0.1.0", "0.2.0"));
+        let ladder = ["0.1.9", "0.2.0-1", "0.2.0-beta.1", "0.2.0-dev.42", "0.2.0-rc.1", "0.2.0-rc.2", "0.2.0-rc.10", "0.2.0"];
+        for (i, low) in ladder.iter().enumerate() {
+            assert!(!newer(low, low));
+            for high in &ladder[i + 1..] {
+                assert!(newer(high, low), "{high} should be newer than {low}");
+                assert!(!newer(low, high), "{low} should not be newer than {high}");
+            }
+        }
+        for bad in ["", "vv1.0.0", "1.+2.0", "1.2.", "1.2.0-", "1.2.0-rc..1", "99.0.0/../../evil", r"99.0.0\evil", "99.0.0:ads"] {
+            assert!(!newer(bad, "0.2.0"), "accepted invalid candidate {bad:?}");
+            assert!(!newer("99.0.0", bad), "accepted invalid current {bad:?}");
+        }
+    }
+
+    #[test]
+    fn staged_rejects_traversal_and_output_within_drains_large_pipes() {
+        let tmp = std::env::temp_dir().join(format!("kiri-win-update-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&tmp);
+        let stage = tmp.join("Kiri").join("update");
+        std::fs::create_dir_all(&stage).unwrap();
+        std::fs::write(tmp.join("evil.msi"), b"fake").unwrap();
+        std::fs::write(stage.join("version"), "99.0.0/../../../evil").unwrap();
+        assert_eq!(super::staged_in(&stage), None);
+
+        std::fs::write(stage.join("Kiri-99.1.2.msi"), b"msi").unwrap();
+        std::fs::write(stage.join("version"), "v99.1.2\n").unwrap();
+        assert_eq!(super::staged_in(&stage).as_deref(), Some("99.1.2"));
+        let _ = std::fs::remove_dir_all(&tmp);
+
+        let mut cmd = crate::win::tool("powershell.exe");
+        cmd.args([
+            "-NoProfile",
+            "-NonInteractive",
+            "-Command",
+            "[Console]::Out.Write('A' * 131072); [Console]::Error.Write('B' * 131072)",
+        ]);
+        let out = super::output_within(&mut cmd, std::time::Duration::from_secs(15)).unwrap();
+        assert!(out.status.success());
+        assert_eq!(out.stdout.len(), 131_072);
+        assert_eq!(out.stderr.len(), 131_072);
     }
 
     #[test]
