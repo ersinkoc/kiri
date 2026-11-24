@@ -145,28 +145,104 @@ pub fn is_within(child: &Path, parent: &Path) -> bool {
 }
 
 fn norm_key(p: &Path) -> String {
-    let s = p.to_string_lossy().replace('\\', "/");
-    let s = s.trim_end_matches('/');
-    // Preserve root drive like "c:" -> "c:/"
-    if s.len() == 2 && s.as_bytes()[1] == b':' {
-        format!("{}/", s.to_ascii_lowercase())
+    let raw = p.to_string_lossy().replace('\\', "/");
+    let bytes = raw.as_bytes();
+    let (prefix, rest) = if bytes.len() >= 2 && bytes[0].is_ascii_alphabetic() && bytes[1] == b':' {
+        (raw[..2].to_ascii_lowercase(), &raw[2..])
+    } else if let Some(stripped) = raw.strip_prefix('/') {
+        ("/".to_owned(), stripped)
     } else {
-        s.to_ascii_lowercase()
+        (String::new(), raw.as_str())
+    };
+    let mut parts: Vec<String> = Vec::new();
+    for seg in rest.split('/') {
+        let trimmed_spaces = seg.trim_end_matches(' ');
+        if trimmed_spaces.is_empty() || trimmed_spaces == "." {
+            continue;
+        }
+        if trimmed_spaces == ".." {
+            parts.pop();
+            continue;
+        }
+        let cleaned = trimmed_spaces.trim_end_matches([' ', '.']);
+        let norm = if cleaned.is_empty() { trimmed_spaces } else { cleaned };
+        parts.push(norm.to_ascii_lowercase());
+    }
+    if parts.is_empty() {
+        if prefix.ends_with(':') {
+            format!("{prefix}/")
+        } else {
+            prefix
+        }
+    } else if prefix == "/" {
+        format!("/{}", parts.join("/"))
+    } else if !prefix.is_empty() {
+        format!("{prefix}/{}", parts.join("/"))
+    } else {
+        parts.join("/")
     }
 }
 
-/// Whether `raw` is an absolute local Windows drive path (`C:\...`),
-/// rejecting relative paths, parent traversal (`..`), and UNC shares (`\\...`).
+fn is_reserved_dos_name(seg: &str) -> bool {
+    let trimmed = seg.trim_end_matches([' ', '.']);
+    let stem = trimmed.split('.').next().unwrap_or(trimmed).trim_end_matches(' ');
+    matches!(
+        stem.to_ascii_uppercase().as_str(),
+        "CON"
+            | "PRN"
+            | "AUX"
+            | "NUL"
+            | "COM1"
+            | "COM2"
+            | "COM3"
+            | "COM4"
+            | "COM5"
+            | "COM6"
+            | "COM7"
+            | "COM8"
+            | "COM9"
+            | "LPT1"
+            | "LPT2"
+            | "LPT3"
+            | "LPT4"
+            | "LPT5"
+            | "LPT6"
+            | "LPT7"
+            | "LPT8"
+            | "LPT9"
+    )
+}
+
+/// Whether `raw` is an absolute local Windows drive folder path (`C:\Folder`),
+/// rejecting bare drive roots (`C:\`), relative paths, parent traversal (`..`),
+/// UNC shares (`\\...`), invalid Win32 characters, and reserved DOS names.
 pub fn is_local_windows_path(raw: &str) -> bool {
     let s = raw.trim();
     if s.starts_with(r"\\") || s.starts_with("//") {
+        return false;
+    }
+    if s.chars().any(|c| (c as u32) < 0x20) {
         return false;
     }
     let bytes = s.as_bytes();
     if bytes.len() < 3 || !bytes[0].is_ascii_alphabetic() || bytes[1] != b':' || (bytes[2] != b'\\' && bytes[2] != b'/') {
         return false;
     }
-    !s.split(['\\', '/']).any(|seg| seg == "..")
+    let mut has_folder = false;
+    for seg in s[3..].split(['\\', '/']) {
+        if seg.is_empty() || seg == "." {
+            continue;
+        }
+        if seg == ".." || seg.contains([':', '*', '?', '"', '<', '>', '|']) {
+            return false;
+        }
+        let cleaned = seg.trim_end_matches([' ', '.']);
+        if cleaned.is_empty() || is_reserved_dos_name(cleaned) {
+            return false;
+        }
+        has_folder = true;
+    }
+    has_folder
 }
 
 /// Filesystems that cannot reliably hold a WSL 2 `ext4.vhdx`.
@@ -177,7 +253,7 @@ pub fn refused_fs(name: &str) -> bool {
 
 /// Margin kept free beside the data: 10% plus 1 GB.
 pub fn headroom(bytes: u64) -> u64 {
-    bytes / 10 + 1_000_000_000
+    (bytes / 10).saturating_add(1_000_000_000)
 }
 
 fn format_gb(bytes: u64) -> String {
@@ -232,7 +308,7 @@ pub fn validate_target(
         return Err(format!("{} is on a {fs} drive, which can't hold Kiri's WSL disk: choose a folder on an NTFS drive", target.display()));
     }
     probe_write(near).map_err(|e| format!("Kiri can't write in {}: {e}", near.display()))?;
-    let needed = if copy { used_bytes + headroom(used_bytes) } else { headroom(0) };
+    let needed = if copy { used_bytes.saturating_add(headroom(used_bytes)) } else { headroom(0) };
     let free = free_bytes(near).map_err(|e| format!("{}: {e}", near.display()))?;
     if free < needed {
         return Err(format!("{} has {} free, and Kiri's data needs {} there", near.display(), format_gb(free), format_gb(needed)));
@@ -767,5 +843,53 @@ mod tests {
         let r = validate_target(cur, r"D:\Kiri", 5_000_000_000, true, |_| Ok("exFAT".into()), plenty, writable);
         assert!(r.is_err());
         let _ = (Checked { needed: 0, free: 0, replaces: false }, IGNORED, MOVING, format_gb(1_000_000_000));
+    }
+
+    #[test]
+    fn normalizes_dot_segments_trailing_dots_and_rejects_roots_devices_and_overflow() {
+        let ok_fs = |_: &Path| Ok("NTFS".to_owned());
+        let plenty = |_: &Path| Ok(100_000_000_000u64);
+        let writable = |_: &Path| Ok(());
+        let cur = Path::new(r"C:\Users\u\AppData\Local\Kiri\wsl\kiri");
+
+        assert!(same_path(cur, Path::new(r"C:\Users\u\AppData\Local\Kiri\wsl\.\kiri.")));
+        assert!(same_path(cur, Path::new(r"c:\\users\\u\\appdata\\local\\kiri\\wsl\\kiri   \\")));
+        assert!(is_within(Path::new(r"C:\Users\u\AppData\Local\Kiri\wsl\kiri.\sub"), cur));
+        assert!(is_within(cur, Path::new(r"C:\Users\u\AppData\Local\Kiri\. ")));
+
+        for sneaky_same in [
+            r"C:\Users\u\AppData\Local\Kiri\wsl\.\kiri",
+            r"C:\Users\u\AppData\Local\Kiri\wsl\kiri.",
+            r"C:\\Users\\u\\AppData\\Local\\Kiri\\wsl\\kiri\\",
+        ] {
+            assert!(validate_target(cur, sneaky_same, 0, true, ok_fs, plenty, writable).unwrap_err().contains("already in"));
+        }
+        for sneaky_child in [
+            r"C:\Users\u\AppData\Local\Kiri\wsl\.\kiri\sub",
+            r"C:\\Users\\u\\AppData\\Local\\Kiri\\wsl\\kiri\\sub",
+            r"C:\Users\u\AppData\Local\Kiri\wsl\kiri.\sub",
+        ] {
+            assert!(validate_target(cur, sneaky_child, 0, true, ok_fs, plenty, writable).unwrap_err().contains("inside Kiri's data folder"));
+        }
+
+        for bad in [
+            r"C:\",
+            r"D:/",
+            r"C:\.",
+            r"C:\...",
+            r"C:\Kiri:ads",
+            r"C:\Kiri\bad*name",
+            "C:\\Kiri\\bad\tname",
+            r"C:\CON",
+            r"C:\Kiri\NUL",
+            r"C:\Kiri\com1.txt",
+            r"C:\Kiri\lpt9.log",
+        ] {
+            assert!(!is_local_windows_path(bad), "expected false for {bad:?}");
+        }
+        assert!(is_local_windows_path(r"D:\CONSOLE\COM10\.hidden"));
+
+        assert_eq!(headroom(u64::MAX), (u64::MAX / 10).saturating_add(1_000_000_000));
+        assert!(validate_target(cur, r"C:\KiriOtherTest", u64::MAX, true, ok_fs, plenty, writable).is_err());
     }
 }
