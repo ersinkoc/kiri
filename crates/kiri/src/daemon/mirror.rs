@@ -681,11 +681,16 @@ fn answer_stream<R: BufRead, W: Write>(r: &mut R, w: &mut W, engine: &Engine) ->
             return w.flush();
         };
         if !line.ends_with('\n') {
-            head(w, "400 Bad Request", "", 0)?;
+            let status = if head_reader.limit() == 0 { "431 Request Header Fields Too Large" } else { "400 Bad Request" };
+            head(w, status, "", 0)?;
             return w.flush();
         }
-        let mut parts = line.split_whitespace();
-        let (method, target) = (parts.next().unwrap_or_default().to_owned(), parts.next().unwrap_or_default().to_owned());
+        let mut parts = line.split_ascii_whitespace();
+        let (Some(method), Some(target), Some(_version), None) = (parts.next(), parts.next(), parts.next(), parts.next()) else {
+            head(w, "400 Bad Request", "", 0)?;
+            return w.flush();
+        };
+        let (method, target) = (method.to_owned(), target.to_owned());
         let mut content_length: Option<u64> = None;
         let mut chunked = false;
         let mut expect_continue = false;
@@ -700,7 +705,8 @@ fn answer_stream<R: BufRead, W: Write>(r: &mut R, w: &mut W, engine: &Engine) ->
                 return w.flush();
             };
             if !h.ends_with('\n') {
-                head(w, "400 Bad Request", "", 0)?;
+                let status = if head_reader.limit() == 0 { "431 Request Header Fields Too Large" } else { "400 Bad Request" };
+                head(w, status, "", 0)?;
                 return w.flush();
             }
             if h.trim().is_empty() {
@@ -728,7 +734,8 @@ fn answer_stream<R: BufRead, W: Write>(r: &mut R, w: &mut W, engine: &Engine) ->
             }
         }
         if !saw_end || (chunked && content_length.is_some()) {
-            head(w, "400 Bad Request", "", 0)?;
+            let status = if !saw_end && head_reader.limit() == 0 { "431 Request Header Fields Too Large" } else { "400 Bad Request" };
+            head(w, status, "", 0)?;
             return w.flush();
         }
         let framing = if chunked {
@@ -1118,16 +1125,17 @@ enum Found {
 }
 
 /// Content-Type for raw manifest or index JSON `bytes`.
-fn manifest_media_type(bytes: &[u8]) -> String {
-    if let Ok(v) = serde_json::from_slice::<Value>(bytes) {
-        if let Some(mt) = v["mediaType"].as_str().map(str::trim).filter(|m| !m.is_empty() && !m.contains(['\r', '\n'])) {
-            return mt.to_owned();
-        }
-        if v.get("manifests").is_some() {
-            return OCI_INDEX.to_owned();
-        }
+fn manifest_media_type(bytes: &[u8]) -> Option<String> {
+    let v: Value = serde_json::from_slice(bytes).ok()?;
+    let is_index = v.get("manifests").is_some_and(Value::is_array);
+    let is_manifest = v.get("layers").is_some_and(Value::is_array) && v.get("config").is_some_and(Value::is_object);
+    if !is_index && !is_manifest {
+        return None;
     }
-    OCI_MANIFEST.to_owned()
+    if let Some(mt) = v["mediaType"].as_str().map(str::trim).filter(|m| !m.is_empty() && !m.contains(['\r', '\n'])) {
+        return Some(mt.to_owned());
+    }
+    Some(if is_index { OCI_INDEX } else { OCI_MANIFEST }.to_owned())
 }
 
 /// Reads a raw upstream manifest or multi-arch index blob saved during `pull`,
@@ -1139,10 +1147,11 @@ fn stored_manifest(store: &kiri_image::Store, digest: &str) -> Option<(Vec<u8>, 
         return None;
     }
     let bytes = std::fs::read(path).ok()?;
-    (kiri_image::store::sha256_digest(&bytes) == digest).then(|| {
-        let media_type = manifest_media_type(&bytes);
-        (bytes, media_type)
-    })
+    if kiri_image::store::sha256_digest(&bytes) != digest {
+        return None;
+    }
+    let media_type = manifest_media_type(&bytes)?;
+    Some((bytes, media_type))
 }
 
 /// An image's manifest as Kiri serves it, and its digest.
@@ -1194,7 +1203,7 @@ fn lookup(store: &kiri_image::Store, path: &str, token: &str) -> Option<Found> {
                     let raw_pin = images
                         .iter()
                         .filter(in_repo)
-                        .any(|i| i.digest == reference || i.index_digest.as_deref() == Some(reference.as_str()))
+                        .any(|i| (i.digest != i.config_digest && i.digest == reference) || i.index_digest.as_deref() == Some(reference.as_str()))
                         .then(|| store.pin(&reference));
                     let repo_images: Vec<(Image, kiri_image::store::Pin)> =
                         images.iter().filter(in_repo).map(|i| (i.clone(), store.pin(&i.config_digest))).collect();
@@ -1692,6 +1701,50 @@ mod tests {
         assert_eq!(untagged.committed_digest().as_deref(), Some(cfg_digest.as_str()));
         assert!(engine.store.find(&cfg_digest).unwrap().is_some(), "untagged image stored under config digest");
         drop(untagged);
+
+        drop(engine);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn config_digests_are_not_manifests_and_incomplete_requests_are_rejected() {
+        let dir = std::env::temp_dir().join(format!("kiri-mirror-http-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let store = kiri_image::Store::open(&dir).unwrap();
+        let write_blob = |bytes: &[u8]| {
+            let mut w = store.ingest().unwrap();
+            w.write_all(bytes).unwrap();
+            w.finish().unwrap()
+        };
+        let cfg = json!({"architecture": "amd64", "os": "linux", "config": {}});
+        let (cfg_digest, _) = write_blob(&serde_json::to_vec(&cfg).unwrap());
+        let (layer_digest, layer_size) = write_blob(b"layer-bytes");
+        let layers = vec![kiri_image::Layer { digest: layer_digest, size: layer_size, media_type: "application/vnd.oci.image.layer.v1.tar".into() }];
+        let local = kiri_image::archive::from_config("myapp:dev".into(), &cfg_digest, &cfg, layers);
+        store.put_image(local).unwrap();
+
+        assert!(lookup(&store, &format!("/v2/tok/docker.io/library/myapp/manifests/{cfg_digest}"), "tok").is_none());
+        assert!(matches!(lookup(&store, &format!("/v2/tok/docker.io/library/myapp/blobs/{cfg_digest}"), "tok"), Some(Found::Blob(..))));
+
+        let engine = Engine::boot(store).unwrap();
+        let tok = token();
+        let send = |raw: &[u8]| -> String {
+            let mut r = BufReader::new(io::Cursor::new(raw));
+            let mut w = Vec::new();
+            answer_stream(&mut r, &mut w, &engine).unwrap();
+            String::from_utf8_lossy(&w).into_owned()
+        };
+
+        assert!(send(format!("GET /v2/{tok}/docker.io/library/myapp/manifests/dev HTTP/1.1\r\nHost: x\r\n\r\n").as_bytes()).starts_with("HTTP/1.1 200 OK\r\n"));
+        assert!(send(format!("GET /v2/{tok}/docker.io/library/myapp/manifests/{cfg_digest} HTTP/1.1\r\nHost: x\r\n\r\n").as_bytes()).starts_with("HTTP/1.1 404 Not Found\r\n"));
+        assert!(send(format!("GET /v2/{tok}/docker.io/library/myapp/manifests/dev HTTP/1.1\r\nHost: x\r\n").as_bytes()).starts_with("HTTP/1.1 400 Bad Request\r\n"));
+
+        let mut over = b"GET ".to_vec();
+        let path = format!("/v2/{tok}/docker.io/library/myapp/manifests/dev");
+        over.extend(std::iter::repeat_n(b' ', (16 << 10) - 4 - path.len()));
+        over.extend_from_slice(path.as_bytes());
+        over.extend_from_slice(b"-staging HTTP/1.1\r\nHost: x\r\n\r\n");
+        assert!(send(&over).starts_with("HTTP/1.1 431 Request Header Fields Too Large\r\n"));
 
         drop(engine);
         let _ = std::fs::remove_dir_all(&dir);
