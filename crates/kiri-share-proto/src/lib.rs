@@ -365,16 +365,17 @@ impl<'a> Reader<'a> {
     fn rest_str(&mut self) -> Result<&'a str, DecodeError> {
         core::str::from_utf8(self.rest()).map_err(|_| DecodeError::BadUtf8)
     }
+
+    fn end(&self) -> Result<(), DecodeError> {
+        if self.pos == self.buf.len() { Ok(()) } else { Err(DecodeError::Truncated) }
+    }
 }
 
 /// Returns the total size of the frame whose 4-byte length prefix is
 /// `header`, so a reader can size exactly one read for the rest.
 pub fn frame_len(header: &[u8; 4]) -> Result<usize, DecodeError> {
     let len = u32::from_le_bytes(*header) as usize;
-    if len < 2 || len + 4 > MAX_FRAME {
-        return Err(DecodeError::TooLarge(len));
-    }
-    Ok(len + 4)
+    len.checked_add(4).filter(|&total| len >= 2 && total <= MAX_FRAME).ok_or(DecodeError::TooLarge(len))
 }
 
 /// Decodes one complete frame (header included).
@@ -382,10 +383,14 @@ pub fn decode(frame: &[u8]) -> Result<Msg<'_>, DecodeError> {
     if frame.len() < HEADER {
         return Err(DecodeError::Truncated);
     }
+    let expected = frame_len(frame[..4].try_into().map_err(|_| DecodeError::Truncated)?)?;
+    if frame.len() != expected {
+        return Err(DecodeError::Truncated);
+    }
     let kind = u16::from_le_bytes([frame[4], frame[5]]);
     let mut r = Reader { buf: &frame[HEADER..], pos: 0 };
-    Ok(match kind {
-        kind::HELLO => Msg::Hello(Hello {
+    let msg = match kind {
+        kind::HELLO => return Ok(Msg::Hello(Hello {
             protocol: r.u16()?,
             token: r.str()?,
             device: r.str()?,
@@ -395,8 +400,8 @@ pub fn decode(frame: &[u8]) -> Result<Msg<'_>, DecodeError> {
             features: r.opt_u32()?,
             machine: r.opt_str()?,
             host: r.opt_str()?,
-        }),
-        kind::WELCOME => Msg::Welcome(Welcome {
+        })),
+        kind::WELCOME => return Ok(Msg::Welcome(Welcome {
             url: r.str()?,
             rate: r.u32()?,
             remaining: r.u64()?,
@@ -405,7 +410,7 @@ pub fn decode(frame: &[u8]) -> Result<Msg<'_>, DecodeError> {
             lanes: r.opt_u32()?,
             lane_key: r.opt_str()?,
             window: r.opt_u32()?,
-        }),
+        })),
         kind::REFUSED => Msg::Refused(r.rest_str()?),
         kind::OPEN => Msg::Open { stream: r.u32()?, remote: r.rest_str()? },
         kind::DATA => Msg::Data { stream: r.u32()?, data: r.rest() },
@@ -422,7 +427,9 @@ pub fn decode(frame: &[u8]) -> Result<Msg<'_>, DecodeError> {
         kind::JOINED => Msg::Joined,
         kind::CHUNK => Msg::Chunk { stream: r.u32()?, seq: r.u32()?, fin: r.u8()? != 0, data: r.rest() },
         k => return Err(DecodeError::UnknownKind(k)),
-    })
+    };
+    r.end()?;
+    Ok(msg)
 }
 
 #[cfg(test)]
@@ -563,9 +570,21 @@ mod tests {
     #[test]
     fn rejects_oversized_unknown_and_truncated() {
         assert_eq!(frame_len(&(MAX_FRAME as u32).to_le_bytes()), Err(DecodeError::TooLarge(MAX_FRAME)));
+        assert_eq!(frame_len(&u32::MAX.to_le_bytes()), Err(DecodeError::TooLarge(u32::MAX as usize)));
         assert_eq!(frame_len(&1u32.to_le_bytes()), Err(DecodeError::TooLarge(1)));
         assert_eq!(decode(&[2, 0, 0, 0, 99, 0]), Err(DecodeError::UnknownKind(99)));
         assert_eq!(decode(&[6, 0, 0, 0, 6, 0, 1, 0]), Err(DecodeError::Truncated));
         assert_eq!(decode(&[1, 0]), Err(DecodeError::Truncated));
+
+        let mut data = Vec::new();
+        Msg::Data { stream: 7, data: b"hello" }.encode(&mut data);
+        assert_eq!(decode(&data[..data.len() - 2]), Err(DecodeError::Truncated));
+
+        let mut close = Vec::new();
+        Msg::Close { stream: 7 }.encode(&mut close);
+        close.extend_from_slice(b"extra");
+        let len = (close.len() - 4) as u32;
+        close[..4].copy_from_slice(&len.to_le_bytes());
+        assert_eq!(decode(&close), Err(DecodeError::Truncated));
     }
 }
