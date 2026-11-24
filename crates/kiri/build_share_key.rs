@@ -37,7 +37,12 @@ fn write_share_build_key() {
 
 fn parse_share_key(s: &str) -> Option<(&str, [u8; 32])> {
     let (id, hex) = s.trim().split_once(':')?;
-    if id.is_empty() || id.len() > 32 || !id.bytes().all(|b| b.is_ascii_alphanumeric() || b"-_.".contains(&b)) || hex.len() != 64 {
+    if id.is_empty()
+        || id.len() > 32
+        || !id.bytes().all(|b| b.is_ascii_alphanumeric() || b"-_.".contains(&b))
+        || hex.len() != 64
+        || !hex.bytes().all(|b| b.is_ascii_hexdigit())
+    {
         return None;
     }
     let mut key = [0u8; 32];

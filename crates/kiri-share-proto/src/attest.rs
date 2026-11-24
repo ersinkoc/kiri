@@ -53,7 +53,7 @@ pub fn verify(key: &[u8; KEY_LEN], nonce: &[u8; NONCE_LEN], token: &str, device:
 pub fn parse_key(s: &str) -> Option<(&str, [u8; KEY_LEN])> {
     let (id, hex) = s.trim().split_once(':')?;
     let id_ok = !id.is_empty() && id.len() <= MAX_KEY_ID && id.bytes().all(|b| b.is_ascii_alphanumeric() || b"-_.".contains(&b));
-    if !id_ok || hex.len() != KEY_LEN * 2 {
+    if !id_ok || hex.len() != KEY_LEN * 2 || !hex.bytes().all(|b| b.is_ascii_hexdigit()) {
         return None;
     }
     let mut key = [0u8; KEY_LEN];
@@ -123,6 +123,8 @@ mod tests {
         assert!(parse_key(&alloc::format!("{}:{hex}", "x".repeat(33))).is_none(), "long id");
         assert!(parse_key("r1:0011").is_none(), "short key");
         assert!(parse_key(&alloc::format!("r1:{}", "zz".repeat(32))).is_none(), "not hex");
+        assert!(parse_key(&alloc::format!("r1:{}", "+a".repeat(32))).is_none(), "signed hex pair");
+        assert!(parse_key(&alloc::format!("r1:+1{}", &hex[2..])).is_none(), "leading plus");
         assert!(parse_key(&alloc::format!("r1:{}", "é".repeat(32))).is_none(), "not ASCII");
     }
 }
