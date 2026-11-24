@@ -56,12 +56,16 @@ static QUIET_UNTIL: AtomicU64 = AtomicU64::new(0);
 /// The command running for the window ("start", "stop", "set",
 /// "deletecluster"), one at a time.
 static OP: Mutex<Option<&'static str>> = Mutex::new(None);
-/// The one pod log stream the page shows, as detail.rs keeps the container's.
-static LOGS: Mutex<Option<Closer>> = Mutex::new(None);
+/// The one pod log stream the page shows, as detail.rs keeps the container's;
+/// its node process is killed on stop because closing the connection doesn't end an exec.
+struct LogState {
+    generation: u64,
+    closer: Option<Closer>,
+    pid: Option<u32>,
+}
+
+static LOGS: Mutex<LogState> = Mutex::new(LogState { generation: 0, closer: None, pid: None });
 static LOGS_GEN: AtomicU64 = AtomicU64::new(0);
-/// The node's process for the stream: closing the connection doesn't end an
-/// exec, so a stop kills it.
-static LOGS_PID: Mutex<Option<u32>> = Mutex::new(None);
 
 fn spawn(name: &str, f: impl FnOnce() + Send + 'static) {
     let _ = std::thread::Builder::new().name(name.into()).spawn(f);
@@ -88,7 +92,9 @@ pub fn handle(action: &str, value: &Value) {
         }
         "delete" => delete(arg("ns"), arg("pod")),
         "logs" => logs(arg("ns"), arg("pod"), arg("container"), value["previous"] == true),
-        "logsstop" => stop_logs(),
+        "logsstop" => {
+            stop_logs();
+        }
         "copy" => copy(value["text"].as_str().unwrap_or("")),
         _ => {}
     }
@@ -719,11 +725,10 @@ pub(crate) fn forget() -> io::Result<()> {
 /// batches of a few milliseconds as the container page's logs. `previous`
 /// shows the run before the last restart instead (a crash loop's reason).
 fn logs(ns: String, pod: String, container: String, previous: bool) {
-    stop_logs();
+    let generation = stop_logs();
     if !valid(&ns) || !valid(&pod) || !valid(&container) {
         return;
     }
-    let generation = LOGS_GEN.load(Ordering::SeqCst);
     let key = format!("{ns}/{pod}/{container}{}", if previous { "/previous" } else { "" });
     spawn("kiri-k8s-logs", move || {
         let which = if previous { "--previous" } else { "-f" };
@@ -732,15 +737,53 @@ fn logs(ns: String, pod: String, container: String, previous: bool) {
             Ok(s) => s,
             Err(e) => return emit(notice("error", &trf("Logs: {error}", &[("error", &e)]))),
         };
+        let already_stale = {
+            let mut st = LOGS.lock().unwrap_or_else(|e| e.into_inner());
+            if st.generation == generation {
+                st.closer = Some(r.closer());
+                false
+            } else {
+                true
+            }
+        };
+        let guard = already_stale.then(|| {
+            let pair = std::sync::Arc::new((Mutex::new(false), std::sync::Condvar::new()));
+            let (pair2, closer) = (pair.clone(), r.closer());
+            spawn("kiri-k8s-logs-stale", move || {
+                let (lock, cvar) = &*pair2;
+                let done = lock.lock().unwrap_or_else(|e| e.into_inner());
+                let (done, _) = cvar.wait_timeout_while(done, Duration::from_secs(1), |d| !*d).unwrap_or_else(|e| e.into_inner());
+                if !*done {
+                    closer.close();
+                }
+            });
+            pair
+        });
         let mut first = String::new();
         let _ = r.read_line(&mut first);
-        if let Ok(pid) = first.trim().parse::<u32>() {
-            if LOGS_GEN.load(Ordering::SeqCst) != generation {
-                return kill(pid);
-            }
-            *LOGS_PID.lock().unwrap_or_else(|e| e.into_inner()) = Some(pid);
+        if let Some(pair) = guard {
+            let (lock, cvar) = &*pair;
+            *lock.lock().unwrap_or_else(|e| e.into_inner()) = true;
+            cvar.notify_all();
         }
-        *LOGS.lock().unwrap_or_else(|e| e.into_inner()) = Some(r.closer());
+        let pid = first.trim().parse::<u32>().ok();
+        let stale = {
+            let mut st = LOGS.lock().unwrap_or_else(|e| e.into_inner());
+            if st.generation != generation {
+                true
+            } else {
+                st.pid = pid;
+                false
+            }
+        };
+        if stale {
+            r.closer().close();
+            drop(r);
+            if let Some(pid) = pid {
+                kill(pid);
+            }
+            return;
+        }
         let (tx, rx) = mpsc::channel::<Vec<u8>>();
         let flush_key = key.clone();
         spawn("kiri-k8s-logs-emit", move || {
@@ -782,8 +825,10 @@ fn logs(ns: String, pod: String, container: String, previous: bool) {
             }
         }
         // Ended by itself: its pid may be another process's soon.
-        if LOGS_GEN.load(Ordering::SeqCst) == generation {
-            LOGS_PID.lock().unwrap_or_else(|e| e.into_inner()).take();
+        let mut st = LOGS.lock().unwrap_or_else(|e| e.into_inner());
+        if st.generation == generation {
+            st.pid = None;
+            st.closer = None;
         }
     });
 }
@@ -796,14 +841,20 @@ fn kill(pid: u32) {
     });
 }
 
-fn stop_logs() {
-    LOGS_GEN.fetch_add(1, Ordering::SeqCst);
-    if let Some(pid) = LOGS_PID.lock().unwrap_or_else(|e| e.into_inner()).take() {
+fn stop_logs() -> u64 {
+    let (generation, pid, closer) = {
+        let mut st = LOGS.lock().unwrap_or_else(|e| e.into_inner());
+        st.generation = st.generation.wrapping_add(1);
+        LOGS_GEN.store(st.generation, Ordering::SeqCst);
+        (st.generation, st.pid.take(), st.closer.take())
+    };
+    if let Some(pid) = pid {
         kill(pid);
     }
-    if let Some(c) = LOGS.lock().unwrap_or_else(|e| e.into_inner()).take() {
+    if let Some(c) = closer {
         c.close();
     }
+    generation
 }
 
 #[cfg(test)]
@@ -890,5 +941,150 @@ mod tests {
             ]
         );
         assert_ne!(super::made_with(&cfg), super::made_with(&super::Config::default()));
+    }
+
+    #[test]
+    fn replacing_or_stopping_pod_logs_during_open_drops_the_stale_stream() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::sync::mpsc::channel;
+        use std::sync::{Arc, Mutex};
+        use std::time::Duration;
+
+        let pipe_name = format!(r"\\.\pipe\kiri-k8s-logs-test-{}", std::process::id());
+        crate::client::set_pipe(&pipe_name);
+
+        let stop_server = Arc::new(AtomicBool::new(false));
+        let (a_in_tx, a_in_rx) = channel();
+        let (a_rel_tx, a_rel_rx) = channel();
+        let (a_fl_tx, a_fl_rx) = channel();
+        let (a_cl_tx, a_cl_rx) = channel();
+        let (b_fl_tx, b_fl_rx) = channel();
+        let (b_cl_tx, b_cl_rx) = channel();
+        let (kills_tx, kills_rx) = channel();
+
+        let gates = Arc::new(Mutex::new((
+            Some((a_in_tx, a_rel_rx)),
+            Some(a_fl_tx),
+            Some(a_cl_tx),
+            Some(b_fl_tx),
+            Some(b_cl_tx),
+        )));
+
+        let mut listener = crate::pipe::Pipe::create(&pipe_name, true).unwrap();
+        let server_thread = {
+            let (pipe_name, stop_server, gates) = (pipe_name.clone(), stop_server.clone(), gates.clone());
+            std::thread::spawn(move || {
+                while !stop_server.load(Ordering::SeqCst) {
+                    if listener.connect().is_err() || stop_server.load(Ordering::SeqCst) {
+                        break;
+                    }
+                    let conn = listener;
+                    let Ok(next) = crate::pipe::Pipe::create(&pipe_name, false) else { break };
+                    listener = next;
+                    let (gates, kills_tx) = (gates.clone(), kills_tx.clone());
+                    std::thread::spawn(move || {
+                        let mut raw = Vec::new();
+                        let mut buf = [0u8; 4096];
+                        let hdr_end = loop {
+                            let Ok(n) = conn.read(&mut buf) else { return };
+                            if n == 0 {
+                                return;
+                            }
+                            raw.extend_from_slice(&buf[..n]);
+                            if let Some(i) = raw.windows(4).position(|w| w == b"\r\n\r\n") {
+                                break i;
+                            }
+                        };
+                        let head = String::from_utf8_lossy(&raw[..hdr_end]).into_owned();
+                        let len = head
+                            .lines()
+                            .find_map(|l| l.split_once(':').filter(|(k, _)| k.trim().eq_ignore_ascii_case("content-length")).and_then(|(_, v)| v.trim().parse::<usize>().ok()))
+                            .unwrap_or(0);
+                        while raw.len() < hdr_end + 4 + len {
+                            let Ok(n) = conn.read(&mut buf) else { return };
+                            if n == 0 {
+                                break;
+                            }
+                            raw.extend_from_slice(&buf[..n]);
+                        }
+                        let req = head.lines().next().unwrap_or("");
+                        let body = String::from_utf8_lossy(&raw[hdr_end + 4..]);
+                        let json_ok = |id: &str| {
+                            let b = format!(r#"{{"Id":"{id}"}}"#);
+                            let _ = conn.write(format!("HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{b}", b.len()).as_bytes());
+                            let _ = conn.write(b"");
+                        };
+                        if req.starts_with("POST /containers/kiri-k8s/exec ") {
+                            let v: serde_json::Value = serde_json::from_str(&body).unwrap_or_default();
+                            let cmd: Vec<String> = v["Cmd"].as_array().into_iter().flatten().filter_map(|x| x.as_str().map(str::to_owned)).collect();
+                            if cmd.first().map(String::as_str) == Some("kill") {
+                                if let Some(pid) = cmd.get(1) {
+                                    let _ = kills_tx.send(pid.clone());
+                                }
+                                json_ok("exec-kill");
+                            } else if cmd.iter().any(|s| s == "pod-a") {
+                                let gate = gates.lock().unwrap().0.take();
+                                if let Some((in_tx, rel_rx)) = gate {
+                                    let _ = in_tx.send(());
+                                    let _ = rel_rx.recv();
+                                }
+                                json_ok("exec-a");
+                            } else if cmd.iter().any(|s| s == "pod-b") {
+                                json_ok("exec-b");
+                            }
+                        } else if req.starts_with("POST /exec/exec-kill/start ") {
+                            let _ = conn.write(b"HTTP/1.1 101 Switching Protocols\r\n\r\n");
+                            let _ = conn.write(b"");
+                        } else if req.starts_with("POST /exec/exec-b/start ") {
+                            let _ = conn.write(b"HTTP/1.1 101 Switching Protocols\r\n\r\n2002\npod-b-live\n");
+                            conn.flush();
+                            let (fl, cl) = {
+                                let mut g = gates.lock().unwrap();
+                                (g.3.take(), g.4.take())
+                            };
+                            if let Some(tx) = fl {
+                                let _ = tx.send(());
+                            }
+                            while conn.read(&mut [0u8; 32]).is_ok() {}
+                            if let Some(tx) = cl {
+                                let _ = tx.send(());
+                            }
+                        } else if req.starts_with("POST /exec/exec-a/start ") {
+                            let _ = conn.write(b"HTTP/1.1 101 Switching Protocols\r\n\r\nsh: warning\nstale-a\n");
+                            conn.flush();
+                            let (fl, cl) = {
+                                let mut g = gates.lock().unwrap();
+                                (g.1.take(), g.2.take())
+                            };
+                            if let Some(tx) = fl {
+                                let _ = tx.send(());
+                            }
+                            while conn.read(&mut [0u8; 32]).is_ok() {}
+                            if let Some(tx) = cl {
+                                let _ = tx.send(());
+                            }
+                        }
+                    });
+                }
+            })
+        };
+
+        super::handle("logs", &serde_json::json!({"ns": "default", "pod": "pod-a", "container": "app"}));
+        a_in_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+
+        super::handle("logs", &serde_json::json!({"ns": "default", "pod": "pod-b", "container": "app"}));
+        b_fl_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+
+        a_rel_tx.send(()).unwrap();
+        a_fl_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+        assert!(a_cl_rx.recv_timeout(Duration::from_secs(2)).is_ok());
+
+        super::handle("logsstop", &serde_json::json!({}));
+        assert!(b_cl_rx.recv_timeout(Duration::from_secs(2)).is_ok());
+        assert_eq!(kills_rx.recv_timeout(Duration::from_secs(2)).unwrap(), "2002");
+
+        stop_server.store(true, Ordering::SeqCst);
+        let _ = crate::pipe::Pipe::open(&pipe_name);
+        let _ = server_thread.join();
     }
 }
